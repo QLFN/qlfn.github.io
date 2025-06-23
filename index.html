@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Noise Text Only</title>
+  <style>
+    html, body {
+      margin: 0;
+      background: black;
+      overflow: hidden;
+      height: 100%;
+    }
+    canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+    }
+  </style>
+</head>
+<body>
+<canvas id="bg"></canvas>
+<canvas id="fg"></canvas>
+<script>
+const bgCanvas = document.getElementById("bg");
+const fgCanvas = document.getElementById("fg");
+const bgCtx = bgCanvas.getContext("2d");
+const fgCtx = fgCanvas.getContext("2d");
+const blockSize = 4;
+let noiseBuffer = [], mask;
+
+const text = atob("bmlja0BkaWVkcmljaC5tZQ==");
+
+function resize() {
+  bgCanvas.width = fgCanvas.width = window.innerWidth;
+  bgCanvas.height = fgCanvas.height = window.innerHeight;
+  drawStaticBackground();
+  const fontSize = getMaxFontSize(text);
+  mask = createTextMask(text, fontSize);
+  generateNoiseBuffer();
+}
+window.addEventListener("resize", resize);
+resize();
+
+function drawStaticBackground() {
+  for (let y = 0; y < bgCanvas.height; y += blockSize) {
+    for (let x = 0; x < bgCanvas.width; x += blockSize) {
+      const s = Math.floor(Math.random() * 255);
+      bgCtx.fillStyle = `rgb(${s},${s},${s})`;
+      bgCtx.fillRect(x, y, blockSize, blockSize);
+    }
+  }
+}
+
+function getMaxFontSize(text) {
+  const tmp = document.createElement("canvas");
+  tmp.width = fgCanvas.width;
+  tmp.height = fgCanvas.height;
+  const ctx = tmp.getContext("2d");
+  let size = 10;
+  do {
+    ctx.font = `bold ${size}px sans-serif`;
+    size++;
+  } while (ctx.measureText(text).width < fgCanvas.width * 0.9 && size < fgCanvas.height * 0.5);
+  return size - 1;
+}
+
+function createTextMask(text, fontSize) {
+  const temp = document.createElement("canvas");
+  temp.width = fgCanvas.width;
+  temp.height = fgCanvas.height;
+  const ctx = temp.getContext("2d");
+  ctx.font = `bold ${fontSize}px sans-serif`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = "white";
+  ctx.fillText(text, temp.width / 2, temp.height / 2);
+  return ctx.getImageData(0, 0, temp.width, temp.height);
+}
+
+function generateNoiseBuffer() {
+  const rows = Math.ceil(fgCanvas.height / blockSize);
+  const cols = Math.ceil(fgCanvas.width / blockSize);
+  noiseBuffer = Array.from({ length: rows }, () =>
+    Array.from({ length: cols }, () => Math.floor(Math.random() * 255))
+  );
+}
+
+function scrollNoiseBuffer() {
+  const cols = noiseBuffer[0].length;
+  const newRow = Array.from({ length: cols }, () => Math.floor(Math.random() * 255));
+  noiseBuffer.pop();
+  noiseBuffer.unshift(newRow);
+}
+
+function animate() {
+  const w = fgCanvas.width;
+  const h = fgCanvas.height;
+  const rows = Math.ceil(h / blockSize);
+  const cols = Math.ceil(w / blockSize);
+
+  fgCtx.clearRect(0, 0, w, h);
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < cols; x++) {
+      const px = x * blockSize;
+      const py = y * blockSize;
+      const i = (py * w + px) * 4;
+      if (mask.data[i + 3] > 128) {
+        const s = noiseBuffer[y][x];
+        fgCtx.fillStyle = `rgb(${s},${s},${s})`;
+        fgCtx.fillRect(px, py, blockSize, blockSize);
+      }
+    }
+  }
+  scrollNoiseBuffer();
+  requestAnimationFrame(animate);
+}
+animate();
+</script>
+</body>
+</html>
