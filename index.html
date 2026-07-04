@@ -218,10 +218,10 @@ function makeThinFlicker(w, h) {
 
 // [kind factory, trigger chance per tick, min duration ms, max extra duration ms]
 const GLITCH_KINDS = [
-  [makeHBar,       0.045, 150, 250],
-  [makeVBar,       0.03,  150, 250],
-  [makeBlock,      0.035, 200, 300],
-  [makeThinFlicker, 0.09,  30,  60]
+  [makeHBar,       0.045, 250, 350],
+  [makeVBar,       0.03,  250, 350],
+  [makeBlock,      0.035, 300, 400],
+  [makeThinFlicker, 0.09,  40,  70]
 ];
 
 function updateGlitchState(now) {
