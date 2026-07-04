@@ -186,7 +186,7 @@ function scrollNoiseBuffer() {
 // their pixels together (in any shape) never reveals anything in a
 // single still frame; the shape only ever emerges from the foreground
 // refreshing every frame while the background holds still.
-const MAX_ACTIVE_GLITCHES = 200;
+const MAX_ACTIVE_GLITCHES = 1000;
 
 function makeHBar(w, h) {
   const bandH = 6 + ((Math.random() * 50) | 0);
@@ -286,7 +286,7 @@ function shiftRect(buffer, w, rect, dx, dy) {
   }
 }
 
-const targetFPS = 3;
+const targetFPS = 6;
 const frameInterval = 1000 / targetFPS;
 let lastFrameTime = 0;
 
