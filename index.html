@@ -26,22 +26,99 @@ const bgCanvas = document.getElementById("bg");
 const fgCanvas = document.getElementById("fg");
 const bgCtx = bgCanvas.getContext("2d", { alpha: false });
 const fgCtx = fgCanvas.getContext("2d");
-const blockSize = 2;
 const text = atob("ZGllZHJpY2gubWU=");
 
+// Each "noise pixel" is now a whole character cell instead of a plain
+// colored block. cellSize is the grid step (both the mask-sampling
+// resolution and the glyph box size). It's derived from the viewport
+// width rather than fixed, so a phone and a 2K desktop show roughly the
+// same NUMBER of characters across the screen instead of the desktop
+// just cramming in far more, tinier-looking cells.
+const TARGET_COLS = 90;   // aim for ~90 character-columns across the screen
+const MIN_CELL = 10;       // floor so letters stay legible on small phones
+const MAX_CELL = 26;       // ceiling so cells don't get comically large on huge monitors
+let cellSize = 14;
+let fontPx = Math.round(cellSize * 0.8);
+const CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".split("");
+
+function updateCellSize() {
+  const raw = window.innerWidth / TARGET_COLS;
+  const next = Math.min(MAX_CELL, Math.max(MIN_CELL, Math.round(raw)));
+  if (next === cellSize && glyphAtlas.length) return false;
+  cellSize = next;
+  fontPx = Math.round(cellSize * 0.8);
+  return true;
+}
+
+// Pre-render every character once into a small alpha mask (how "inked"
+// each pixel of the glyph is, 0-255). Both the background and the
+// foreground reuse this same atlas and the same brightness range, so a
+// still frame is statistically identical everywhere -- letters with
+// random brightness, on or off the text. Only the foreground refreshing
+// every frame while the background stays fixed reveals anything.
+let glyphAtlas = [];
+function buildGlyphAtlas() {
+  const tmp = document.createElement("canvas");
+  tmp.width = cellSize;
+  tmp.height = cellSize;
+  const ctx = tmp.getContext("2d");
+  const atlas = [];
+  for (const ch of CHARS) {
+    ctx.clearRect(0, 0, cellSize, cellSize);
+    ctx.fillStyle = "white";
+    ctx.font = `bold ${fontPx}px monospace`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(ch, cellSize / 2, cellSize / 2 + 1);
+    const id = ctx.getImageData(0, 0, cellSize, cellSize);
+    const mask = new Uint8ClampedArray(cellSize * cellSize);
+    for (let i = 0; i < mask.length; i++) mask[i] = id.data[i * 4 + 3];
+    atlas.push(mask);
+  }
+  return atlas;
+}
+
+// Paints one character cell into an RGBA buffer, fully opaque: pixels
+// under the glyph's ink get `brightness`, everything else in the cell
+// gets 0 (black) -- so the whole cell is always fully covered, whether
+// it's a background cell or an "on" foreground cell.
+function blitChar(buffer, w, h, px, py, mask, brightness) {
+  for (let cy = 0; cy < cellSize; cy++) {
+    const by = py + cy;
+    if (by < 0 || by >= h) continue;
+    const rowBase = by * w * 4;
+    const maskRowBase = cy * cellSize;
+    for (let cx = 0; cx < cellSize; cx++) {
+      const bx = px + cx;
+      if (bx < 0 || bx >= w) continue;
+      const a = mask[maskRowBase + cx];
+      const v = (brightness * a / 255) | 0;
+      const idx = rowBase + bx * 4;
+      buffer[idx] = v;
+      buffer[idx + 1] = v;
+      buffer[idx + 2] = v;
+      buffer[idx + 3] = 255;
+    }
+  }
+}
+
 // Active-region + noise-buffer state (only the bounding box of "on"
-// blocks is ever tracked, instead of the whole canvas grid)
+// cells is ever tracked, instead of the whole canvas grid)
 let onBlocks = [];      // Uint32Array pairs packed as row<<16 | col (relative to bounding box)
 let rowOffset = 0, colOffset = 0, rowCount = 0, colCount = 0;
-let noiseBuffer = [];   // array of Uint8ClampedArray rows, length rowCount, each length colCount
+let noiseBuffer = [];   // array of Uint16Array rows: high byte = brightness, low byte = char index
 let fgImageData = null;
 let fgData = null;
-let bgImageDataOriginal = null; // pristine (un-glitched) background, restored/rebuilt from
+let bgImageDataOriginal = null; // pristine (un-glitched) background
 let activeGlitches = [];        // list of {x0,y0,x1,y1,dx,dy,endTime}
 
 function resize() {
   bgCanvas.width = fgCanvas.width = window.innerWidth;
   bgCanvas.height = fgCanvas.height = window.innerHeight;
+
+  if (updateCellSize()) {
+    glyphAtlas = buildGlyphAtlas();
+  }
 
   drawStaticBackground();
 
@@ -63,21 +140,11 @@ function drawStaticBackground() {
   const imgData = bgCtx.createImageData(w, h);
   const data = imgData.data;
 
-  for (let y = 0; y < h; y += blockSize) {
-    const yEnd = Math.min(y + blockSize, h);
-    for (let x = 0; x < w; x += blockSize) {
+  for (let y = 0; y < h; y += cellSize) {
+    for (let x = 0; x < w; x += cellSize) {
       const s = (Math.random() * 255) | 0;
-      const xEnd = Math.min(x + blockSize, w);
-      for (let by = y; by < yEnd; by++) {
-        let idx = (by * w + x) * 4;
-        for (let bx = x; bx < xEnd; bx++) {
-          data[idx] = s;
-          data[idx + 1] = s;
-          data[idx + 2] = s;
-          data[idx + 3] = 255;
-          idx += 4;
-        }
-      }
+      const charIdx = (Math.random() * CHARS.length) | 0;
+      blitChar(data, w, h, x, y, glyphAtlas[charIdx], s);
     }
   }
   bgCtx.putImageData(imgData, 0, 0);
@@ -113,23 +180,23 @@ function createTextMask(text, fontSize) {
   return ctx.getImageData(0, 0, temp.width, temp.height);
 }
 
-// Precompute which blocks are "on" once (instead of every animation frame),
+// Precompute which cells are "on" once (instead of every animation frame),
 // and shrink the tracked grid down to the bounding box of the text so the
 // per-frame noise generation/scrolling only touches the relevant region.
 function computeOnBlocks(mask) {
   const w = fgCanvas.width, h = fgCanvas.height;
-  const rows = Math.ceil(h / blockSize);
-  const cols = Math.ceil(w / blockSize);
+  const rows = Math.ceil(h / cellSize);
+  const cols = Math.ceil(w / cellSize);
   const data = mask.data;
 
   let minRow = Infinity, maxRow = -Infinity, minCol = Infinity, maxCol = -Infinity;
   const rawOn = [];
 
   for (let y = 0; y < rows; y++) {
-    const py = y * blockSize;
+    const py = y * cellSize;
     const rowBase = py * w * 4;
     for (let x = 0; x < cols; x++) {
-      const px = x * blockSize;
+      const px = x * cellSize;
       const i = rowBase + px * 4;
       if (data[i + 3] > 128) {
         rawOn.push(y, x);
@@ -160,19 +227,25 @@ function computeOnBlocks(mask) {
   }
 }
 
+function randomCell() {
+  const s = (Math.random() * 255) | 0;
+  const charIdx = (Math.random() * CHARS.length) | 0;
+  return (s << 8) | charIdx;
+}
+
 function generateNoiseBuffer() {
   noiseBuffer = new Array(rowCount);
   for (let r = 0; r < rowCount; r++) {
-    const row = new Uint8ClampedArray(colCount);
-    for (let c = 0; c < colCount; c++) row[c] = (Math.random() * 255) | 0;
+    const row = new Uint16Array(colCount);
+    for (let c = 0; c < colCount; c++) row[c] = randomCell();
     noiseBuffer[r] = row;
   }
 }
 
 function scrollNoiseBuffer() {
   if (rowCount === 0) return;
-  const newRow = new Uint8ClampedArray(colCount);
-  for (let c = 0; c < colCount; c++) newRow[c] = (Math.random() * 255) | 0;
+  const newRow = new Uint16Array(colCount);
+  for (let c = 0; c < colCount; c++) newRow[c] = randomCell();
   noiseBuffer.pop();
   noiseBuffer.unshift(newRow);
 }
@@ -180,13 +253,10 @@ function scrollNoiseBuffer() {
 // --- Glitches ----------------------------------------------------------
 // Each glitch is a rectangular region plus a (dx, dy) shift. The pixels
 // inside the rectangle get wrapped/shifted *within their own rectangle*.
-// Crucially, every glitch is applied identically -- same rectangle, same
-// shift -- to both the background and foreground pixel buffers. Since
-// both layers carry noise from the same random distribution, permuting
-// their pixels together (in any shape) never reveals anything in a
-// single still frame; the shape only ever emerges from the foreground
-// refreshing every frame while the background holds still.
-const MAX_ACTIVE_GLITCHES = 1000;
+// Every glitch is applied identically -- same rectangle, same shift -- to
+// both the background and foreground pixel buffers, so it never reveals
+// anything in a single still frame.
+const MAX_ACTIVE_GLITCHES = 5;
 
 function makeHBar(w, h) {
   const bandH = 6 + ((Math.random() * 50) | 0);
@@ -218,10 +288,10 @@ function makeThinFlicker(w, h) {
 
 // [kind factory, trigger chance per tick, min duration ms, max extra duration ms]
 const GLITCH_KINDS = [
-  [makeHBar,       0.045, 250, 350],
-  [makeVBar,       0.03,  250, 350],
-  [makeBlock,      0.035, 300, 400],
-  [makeThinFlicker, 0.09,  40,  70]
+  [makeHBar,        0.045, 150, 250],
+  [makeVBar,        0.03,  150, 250],
+  [makeBlock,       0.035, 200, 300],
+  [makeThinFlicker, 0.09,   30,  60]
 ];
 
 function updateGlitchState(now) {
@@ -310,23 +380,13 @@ function animate(timestamp) {
 
       const y = relRow + rowOffset;
       const x = relCol + colOffset;
-      const px = x * blockSize;
-      const py = y * blockSize;
+      const px = x * cellSize;
+      const py = y * cellSize;
 
-      const s = noiseBuffer[relRow][relCol];
-      const xEnd = Math.min(px + blockSize, w);
-      const yEnd = Math.min(py + blockSize, h);
-
-      for (let by = py; by < yEnd; by++) {
-        let idx = (by * w + px) * 4;
-        for (let bx = px; bx < xEnd; bx++) {
-          fgData[idx] = s;
-          fgData[idx + 1] = s;
-          fgData[idx + 2] = s;
-          fgData[idx + 3] = 255;
-          idx += 4;
-        }
-      }
+      const cell = noiseBuffer[relRow][relCol];
+      const brightness = cell >> 8;
+      const charIdx = cell & 0xff;
+      blitChar(fgData, w, h, px, py, glyphAtlas[charIdx], brightness);
     }
 
     // Apply the exact same glitch rectangles to the foreground buffer as
