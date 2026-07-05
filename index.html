@@ -11,6 +11,13 @@
       overflow: hidden;
       height: 100%;
     }
+    #screen {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+    }
     canvas {
       position: absolute;
       top: 0;
@@ -19,43 +26,36 @@
   </style>
 </head>
 <body>
-<canvas id="bg"></canvas>
-<canvas id="fg"></canvas>
+<div id="screen">
+  <canvas id="bg"></canvas>
+  <canvas id="fg"></canvas>
+</div>
 <script>
+const screenEl = document.getElementById("screen");
 const bgCanvas = document.getElementById("bg");
 const fgCanvas = document.getElementById("fg");
 const bgCtx = bgCanvas.getContext("2d", { alpha: false });
 const fgCtx = fgCanvas.getContext("2d");
-const text = atob("ZGllZHJpY2gubWU=");
+const text = String.fromCharCode(...[137,142,138,137,151,142,136,141,83,146,138].map(n => n - 37));
 
-// Each "noise pixel" is now a whole character cell instead of a plain
-// colored block. cellSize is the grid step (both the mask-sampling
-// resolution and the glyph box size). It's derived from the viewport
-// width rather than fixed, so a phone and a 2K desktop show roughly the
-// same NUMBER of characters across the screen instead of the desktop
-// just cramming in far more, tinier-looking cells.
-const TARGET_COLS = 90;   // aim for ~90 character-columns across the screen
-const MIN_CELL = 10;       // floor so letters stay legible on small phones
-const MAX_CELL = 26;       // ceiling so cells don't get comically large on huge monitors
+const DPR = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+const TARGET_COLS = 90;
+const MIN_CELL = 10;
+const MAX_CELL = 26;
 let cellSize = 14;
 let fontPx = Math.round(cellSize * 0.8);
 const CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".split("");
 
-function updateCellSize() {
-  const raw = window.innerWidth / TARGET_COLS;
-  const next = Math.min(MAX_CELL, Math.max(MIN_CELL, Math.round(raw)));
+function updateCellSize(cssWidth) {
+  const rawCss = cssWidth / TARGET_COLS;
+  const cssCell = Math.min(MAX_CELL, Math.max(MIN_CELL, Math.round(rawCss)));
+  const next = Math.round(cssCell * DPR);
   if (next === cellSize && glyphAtlas.length) return false;
   cellSize = next;
   fontPx = Math.round(cellSize * 0.8);
   return true;
 }
 
-// Pre-render every character once into a small alpha mask (how "inked"
-// each pixel of the glyph is, 0-255). Both the background and the
-// foreground reuse this same atlas and the same brightness range, so a
-// still frame is statistically identical everywhere -- letters with
-// random brightness, on or off the text. Only the foreground refreshing
-// every frame while the background stays fixed reveals anything.
 let glyphAtlas = [];
 function buildGlyphAtlas() {
   const tmp = document.createElement("canvas");
@@ -78,10 +78,6 @@ function buildGlyphAtlas() {
   return atlas;
 }
 
-// Paints one character cell into an RGBA buffer, fully opaque: pixels
-// under the glyph's ink get `brightness`, everything else in the cell
-// gets 0 (black) -- so the whole cell is always fully covered, whether
-// it's a background cell or an "on" foreground cell.
 function blitChar(buffer, w, h, px, py, mask, brightness) {
   for (let cy = 0; cy < cellSize; cy++) {
     const by = py + cy;
@@ -102,21 +98,28 @@ function blitChar(buffer, w, h, px, py, mask, brightness) {
   }
 }
 
-// Active-region + noise-buffer state (only the bounding box of "on"
-// cells is ever tracked, instead of the whole canvas grid)
-let onBlocks = [];      // Uint32Array pairs packed as row<<16 | col (relative to bounding box)
+let onBlocks = [];
 let rowOffset = 0, colOffset = 0, rowCount = 0, colCount = 0;
-let noiseBuffer = [];   // array of Uint16Array rows: high byte = brightness, low byte = char index
+let noiseBuffer = [];
 let fgImageData = null;
 let fgData = null;
-let bgImageDataOriginal = null; // pristine (un-glitched) background
-let activeGlitches = [];        // list of {x0,y0,x1,y1,dx,dy,endTime}
+let bgImageDataOriginal = null;
+let activeGlitches = [];
+let firstLoad = true;
+const pageLoadTime = performance.now();
+let viewportH = window.innerHeight;
 
 function resize() {
-  bgCanvas.width = fgCanvas.width = window.innerWidth;
-  bgCanvas.height = fgCanvas.height = window.innerHeight;
+  const cssW = window.innerWidth;
+  const cssH = window.innerHeight;
+  viewportH = cssH;
 
-  if (updateCellSize()) {
+  bgCanvas.style.width = fgCanvas.style.width = cssW + "px";
+  bgCanvas.style.height = fgCanvas.style.height = cssH + "px";
+  bgCanvas.width = fgCanvas.width = Math.round(cssW * DPR);
+  bgCanvas.height = fgCanvas.height = Math.round(cssH * DPR);
+
+  if (updateCellSize(cssW)) {
     glyphAtlas = buildGlyphAtlas();
   }
 
@@ -131,6 +134,10 @@ function resize() {
   fgData = fgImageData.data;
 
   activeGlitches = [];
+  if (firstLoad) {
+    firstLoad = false;
+    seedInitialGlitchBurst();
+  }
 }
 window.addEventListener("resize", resize);
 resize();
@@ -180,9 +187,6 @@ function createTextMask(text, fontSize) {
   return ctx.getImageData(0, 0, temp.width, temp.height);
 }
 
-// Precompute which cells are "on" once (instead of every animation frame),
-// and shrink the tracked grid down to the bounding box of the text so the
-// per-frame noise generation/scrolling only touches the relevant region.
 function computeOnBlocks(mask) {
   const w = fgCanvas.width, h = fgCanvas.height;
   const rows = Math.ceil(h / cellSize);
@@ -250,12 +254,6 @@ function scrollNoiseBuffer() {
   noiseBuffer.unshift(newRow);
 }
 
-// --- Glitches ----------------------------------------------------------
-// Each glitch is a rectangular region plus a (dx, dy) shift. The pixels
-// inside the rectangle get wrapped/shifted *within their own rectangle*.
-// Every glitch is applied identically -- same rectangle, same shift -- to
-// both the background and foreground pixel buffers, so it never reveals
-// anything in a single still frame.
 const MAX_ACTIVE_GLITCHES = 5;
 
 function makeHBar(w, h) {
@@ -286,7 +284,6 @@ function makeThinFlicker(w, h) {
   return { x0: 0, y0, x1: w, y1: Math.min(h, y0 + bandH), dx, dy: 0 };
 }
 
-// [kind factory, trigger chance per tick, min duration ms, max extra duration ms]
 const GLITCH_KINDS = [
   [makeHBar,        0.045, 150, 250],
   [makeVBar,        0.03,  150, 250],
@@ -294,15 +291,58 @@ const GLITCH_KINDS = [
   [makeThinFlicker, 0.09,   30,  60]
 ];
 
+const TUNE_IN_MS = 3500;
+const TUNE_IN_CHANCE_BOOST = 6;
+const TUNE_IN_EXTRA_SLOTS = 6;
+
+function tuneInProgress(now) {
+  return Math.min(1, (now - pageLoadTime) / TUNE_IN_MS);
+}
+function tuneInDecay(now) {
+
+  const t = tuneInProgress(now);
+  return Math.pow(1 - t, 3);
+}
+
+const MAX_ROLL_FRACTION = 0.06;
+const ROLL_FREQUENCY_HZ = 5;
+
+function updateRollTransform(now) {
+  const decay = tuneInDecay(now);
+  if (decay <= 0.001) {
+    if (screenEl.style.transform) screenEl.style.transform = "";
+    return;
+  }
+  const amplitude = decay * MAX_ROLL_FRACTION * viewportH;
+  const phase = (now / 1000) * ROLL_FREQUENCY_HZ * Math.PI * 2;
+  const offset = amplitude * Math.sin(phase);
+  screenEl.style.transform = `translateY(${offset.toFixed(1)}px)`;
+}
+
+function seedInitialGlitchBurst() {
+  const w = fgCanvas.width, h = fgCanvas.height;
+  const now = pageLoadTime;
+  const burst = [makeBlock(w, h), makeHBar(w, h), makeVBar(w, h), makeHBar(w, h)];
+  for (const g of burst) {
+    g.endTime = now + 220 + Math.random() * 200;
+    activeGlitches.push(g);
+  }
+  rebuildBackgroundGlitch();
+}
+
 function updateGlitchState(now) {
   const before = activeGlitches.length;
   activeGlitches = activeGlitches.filter(g => now < g.endTime);
   let changed = activeGlitches.length !== before;
 
+  const decay = tuneInDecay(now);
+  const chanceMultiplier = 1 + decay * TUNE_IN_CHANCE_BOOST;
+  const dynamicMax = MAX_ACTIVE_GLITCHES + Math.round(decay * TUNE_IN_EXTRA_SLOTS);
+
   const w = fgCanvas.width, h = fgCanvas.height;
   for (const [factory, chance, minDur, extraDur] of GLITCH_KINDS) {
-    if (activeGlitches.length >= MAX_ACTIVE_GLITCHES) break;
-    if (Math.random() < chance) {
+    if (activeGlitches.length >= dynamicMax) break;
+    if (Math.random() < Math.min(0.9, chance * chanceMultiplier)) {
       const rect = factory(w, h);
       rect.endTime = now + minDur + Math.random() * extraDur;
       activeGlitches.push(rect);
@@ -324,8 +364,6 @@ function rebuildBackgroundGlitch() {
   bgCtx.putImageData(new ImageData(buf, w, h), 0, 0);
 }
 
-// Shifts the pixels inside [x0,x1)x[y0,y1) by (dx,dy), wrapping around
-// within that rectangle only (so it reads as a self-contained tear).
 function shiftRect(buffer, w, rect, dx, dy) {
   const { x0, y0, x1, y1 } = rect;
   const rw = x1 - x0, rh = y1 - y0;
@@ -367,11 +405,12 @@ function animate(timestamp) {
   lastFrameTime = timestamp;
 
   updateGlitchState(timestamp);
+  updateRollTransform(timestamp);
 
   const w = fgCanvas.width, h = fgCanvas.height;
 
   if (fgData) {
-    fgData.fill(0); // fully transparent, replaces clearRect
+    fgData.fill(0);
 
     for (let k = 0; k < onBlocks.length; k++) {
       const packed = onBlocks[k];
@@ -389,8 +428,6 @@ function animate(timestamp) {
       blitChar(fgData, w, h, px, py, glyphAtlas[charIdx], brightness);
     }
 
-    // Apply the exact same glitch rectangles to the foreground buffer as
-    // were applied to the background, so the two layers stay in lockstep.
     for (const g of activeGlitches) shiftRect(fgData, w, g, g.dx, g.dy);
 
     fgCtx.putImageData(fgImageData, 0, 0);
